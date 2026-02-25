@@ -1,0 +1,139 @@
+# docker-compose.yml
+# Orchestrates all three services: MongoDB, Express backend, React frontend.
+#
+# Service dependency chain:
+#   mongo ← backend ← frontend
+#
+# To start everything:
+#   docker-compose up --build
+#
+# To run backend tests inside the container:
+#   docker-compose run --rm backend npm test
+
+version: '3.9'
+
+services:
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # SERVICE 1: MongoDB
+  # ─────────────────────────────────────────────────────────────────────────────
+  mongo:
+    image: mongo:7.0
+    container_name: triage_mongo
+    restart: unless-stopped
+
+    environment:
+      # These credentials create an admin user on first boot.
+      # The backend connects using the URI in the backend service below.
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: secret
+      MONGO_INITDB_DATABASE: support_triage
+
+    ports:
+      # Expose to host so you can connect with MongoDB Compass during development
+      # Remove this in production to keep the DB off the public network
+      - "27017:27017"
+
+    volumes:
+      # Named volume persists data across container restarts and rebuilds
+      - mongo_data:/data/db
+
+    networks:
+      - triage_network
+
+    healthcheck:
+      # mongosh replaces the deprecated mongo shell in Mongo 7
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # SERVICE 2: Node.js / Express Backend
+  # ─────────────────────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: triage_backend
+    restart: unless-stopped
+
+    environment:
+      NODE_ENV: production
+      PORT: 5000
+      # MongoDB URI uses the service name "mongo" as the hostname,
+      # which Docker's internal DNS resolves automatically.
+      # Credentials must match MONGO_INITDB_ROOT_USERNAME/PASSWORD above.
+      MONGO_URI: mongodb://admin:secret@mongo:27017/support_triage?authSource=admin
+
+    ports:
+      # Expose backend port to host for direct API testing (e.g. Postman, curl)
+      - "5000:5000"
+
+    depends_on:
+      mongo:
+        # Only start backend after mongo passes its healthcheck.
+        # This prevents "MongoNetworkError: connect ECONNREFUSED" on startup.
+        condition: service_healthy
+
+    networks:
+      - triage_network
+
+    # Mount the backend source for hot-reloading in development.
+    # Comment this out for pure production use to rely on the built image only.
+    volumes:
+      - ./backend:/app
+      # Prevent host node_modules from overwriting the container's node_modules
+      - /app/node_modules
+
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:5000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # SERVICE 3: React Frontend (Vite dev server OR nginx production build)
+  # ─────────────────────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: triage_frontend
+    restart: unless-stopped
+
+    environment:
+      # In production (nginx), the API is proxied by nginx.conf.
+      # In development (vite dev server), vite.config.js handles the proxy.
+      VITE_API_URL: ""
+
+    ports:
+      # Map host port 3000 → container port 80 (nginx serves the React build)
+      - "3000:80"
+
+    depends_on:
+      backend:
+        condition: service_healthy
+
+    networks:
+      - triage_network
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NETWORKS
+# ─────────────────────────────────────────────────────────────────────────────
+networks:
+  triage_network:
+    # Bridge network allows containers to reach each other by service name
+    driver: bridge
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VOLUMES
+# ─────────────────────────────────────────────────────────────────────────────
+volumes:
+  mongo_data:
+    # Docker-managed named volume.
+    # Data persists across `docker-compose down` and rebuilds.
+    # To wipe all data: docker-compose down -v
+    driver: local
